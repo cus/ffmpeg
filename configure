@@ -1303,6 +1303,7 @@ CONFIG_LIST="
     dwt
     error_resilience
     fast_unaligned
+    ffplay_opengl
     fft
     ftrapv
     gpl

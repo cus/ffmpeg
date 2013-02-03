@@ -35,6 +35,9 @@ typedef struct FFplayVideoOutput {
 void blend_subrect(AVPicture *dst, const AVSubtitleRect *rect, int imgw, int imgh);
 
 extern FFplayVideoOutput ffplay_video_output_xv;
+#if CONFIG_FFPLAY_OPENGL
+extern FFplayVideoOutput ffplay_video_output_gl;
+#endif
 
 #endif /* FFPLAY_H */
 

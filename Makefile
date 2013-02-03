@@ -28,6 +28,10 @@ $(foreach prog,$(AVBASENAMES),$(eval OBJS-$(prog) += cmdutils.o))
 OBJS-ffmpeg                   += ffmpeg_opt.o ffmpeg_filter.o
 OBJS-ffmpeg-$(HAVE_VDPAU_X11) += ffmpeg_vdpau.o
 OBJS-ffplay                   += ffplay_xv.o
+ifdef CONFIG_FFPLAY_OPENGL
+OBJS-ffplay                   += ffplay_gl.o
+LIBS-ffplay                   += -lGL
+endif
 TESTTOOLS   = audiogen videogen rotozoom tiny_psnr tiny_ssim base64
 HOSTPROGS  := $(TESTTOOLS:%=tests/%) doc/print_options
 TOOLS       = qt-faststart trasher
