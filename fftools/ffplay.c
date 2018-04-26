@@ -24,11 +24,18 @@
  */
 
 #include "config.h"
+
+/* We use libass for the rendering, and the lavfi/drawutils for blending */
+#define TEXT_SUBTITLES_RENDERING (CONFIG_LIBASS && CONFIG_AVFILTER)
+
 #include <inttypes.h>
 #include <math.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
+#if TEXT_SUBTITLES_RENDERING
+#include <ass/ass.h>
+#endif
 
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
@@ -51,6 +58,9 @@
 # include "libavfilter/avfilter.h"
 # include "libavfilter/buffersink.h"
 # include "libavfilter/buffersrc.h"
+#endif
+#if TEXT_SUBTITLES_RENDERING
+# include "libavfilter/drawutils.h"
 #endif
 
 #include <SDL.h>
@@ -255,6 +265,13 @@ typedef struct VideoState {
 #endif
     struct AudioParams audio_tgt;
     struct SwrContext *swr_ctx;
+#if TEXT_SUBTITLES_RENDERING
+    ASS_Image    *ass_image;
+    ASS_Renderer *ass_renderer;
+    ASS_Track    *ass_track;
+    FFDrawContext ass_render_draw;
+    int last_ass_serial;
+#endif
     int frame_drops_early;
     int frame_drops_late;
 
@@ -402,6 +419,62 @@ static int opt_add_vfilter(void *optctx, const char *opt, const char *arg)
     vfilters_list[nb_vfilters - 1] = arg;
     return 0;
 }
+#endif
+
+#if TEXT_SUBTITLES_RENDERING
+static ASS_Library  *libass_library;
+
+static const int libass_log_level_map[] = {
+    [0] = AV_LOG_QUIET,
+    [1] = AV_LOG_PANIC,
+    [2] = AV_LOG_FATAL,
+    [3] = AV_LOG_ERROR,
+    [4] = AV_LOG_WARNING,
+    [5] = AV_LOG_INFO,
+    [6] = AV_LOG_VERBOSE,
+    [7] = AV_LOG_DEBUG,
+};
+
+static void libass_cb_log(int ass_level, const char *fmt, va_list args, void *ctx)
+{
+    int level = libass_log_level_map[ass_level];
+    av_vlog(ctx, level, fmt, args);
+    av_log(ctx, level, "\n");
+}
+
+static int init_ass_library(void)
+{
+    libass_library = ass_library_init();
+    if (!libass_library) {
+        av_log(NULL, AV_LOG_ERROR, "Could not initialize libass.\n");
+        return AVERROR(EINVAL);
+    }
+    ass_set_message_cb(libass_library, libass_cb_log, NULL);
+    return 0;
+}
+
+static int init_ass_rendering(VideoState *is)
+{
+    is->ass_renderer = ass_renderer_init(libass_library);
+    if (!is->ass_renderer) {
+        av_log(NULL, AV_LOG_ERROR, "Could not initialize libass renderer.\n");
+        return AVERROR(EINVAL);
+    }
+
+    ass_set_fonts(is->ass_renderer, NULL, NULL, 1, NULL, 1);
+
+    return ff_draw_init(&is->ass_render_draw, AV_PIX_FMT_BGRA, FF_DRAW_PROCESS_ALPHA);
+}
+
+static void uninit_ass_library(void)
+{
+    if (libass_library)
+        ass_library_done(libass_library);
+}
+
+#else
+static int    init_ass_library(void) { return 0; }
+static void uninit_ass_library(void) { }
 #endif
 
 static inline
@@ -971,6 +1044,12 @@ static void set_sdl_yuv_conversion_mode(AVFrame *frame)
 #endif
 }
 
+/* libass stores an RGBA color in the format RRGGBBTT, where TT is the transparency level */
+#define AR(c)  ( (c)>>24)
+#define AG(c)  (((c)>>16)&0xFF)
+#define AB(c)  (((c)>>8) &0xFF)
+#define AA(c)  ((0xFF-c) &0xFF)
+
 static void video_image_display(VideoState *is)
 {
     Frame *vp;
@@ -978,6 +1057,8 @@ static void video_image_display(VideoState *is)
     SDL_Rect rect;
 
     vp = frame_queue_peek_last(&is->pictq);
+    calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
+
     if (is->subtitle_st) {
         if (frame_queue_nb_remaining(&is->subpq) > 0) {
             sp = frame_queue_peek(&is->subpq);
@@ -991,6 +1072,8 @@ static void video_image_display(VideoState *is)
                         sp->width = vp->width;
                         sp->height = vp->height;
                     }
+
+                    if (sp->sub.format == 0) {
                     if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
                         return;
 
@@ -1016,14 +1099,55 @@ static void video_image_display(VideoState *is)
                             SDL_UnlockTexture(is->sub_texture);
                         }
                     }
+                    } else {
+                        ASS_Image *image;
+                        if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, rect.w, rect.h, SDL_BLENDMODE_BLEND, 1) < 0)
+                            return;
+
+                        if (!is->ass_track) {
+                            is->ass_track = ass_new_track(libass_library);
+                            if (!is->ass_track) {
+                                av_log(NULL, AV_LOG_ERROR, "Could not create a libass track\n");
+                                return;
+                            }
+                            ass_set_check_readorder(is->ass_track, 0);
+                            ass_process_codec_private(is->ass_track,
+                                                      is->subdec.avctx->subtitle_header,
+                                                      is->subdec.avctx->subtitle_header_size);
+                        }
+
+                        ass_set_frame_size(is->ass_renderer, rect.w, rect.h);
+                        if (sp->serial != is->last_ass_serial ||
+                            is->ass_track->n_events && is->ass_track->events[is->ass_track->n_events - 1].Duration == UINT32_MAX) {
+                            ass_flush_events(is->ass_track);
+                            is->last_ass_serial = sp->serial;
+                        }
+                        for (i = 0; i < sp->sub.num_rects; i++) {
+                            char *ass_line = sp->sub.rects[i]->ass;
+                            int64_t start_time = sp->pts * 1000LL + sp->sub.start_display_time;
+                            int64_t duration = (sp->sub.end_display_time == UINT32_MAX) ? UINT32_MAX : (int64_t)sp->sub.end_display_time - sp->sub.start_display_time;
+                            ass_process_chunk(is->ass_track, ass_line, strlen(ass_line), start_time, duration);
+                        }
+                        image = is->ass_image = ass_render_frame(is->ass_renderer, is->ass_track, vp->pts * 1000LL, NULL);
+                        while (image) {
+                            if (!SDL_LockTexture(is->sub_texture, &(SDL_Rect){image->dst_x, image->dst_y, image->w, image->h}, (void **)pixels, pitch)) {
+                                uint8_t rgba_color[] = {AR(image->color), AG(image->color), AB(image->color), AA(image->color)};
+                                FFDrawColor color;
+                                ff_draw_color(&is->ass_render_draw, &color, rgba_color);
+                                ff_blend_mask(&is->ass_render_draw, &color, pixels, pitch,
+                                              image->w, image->h, image->bitmap, image->stride, image->w, image->h,
+                                              3, 0, 0, 0);
+                                SDL_UnlockTexture(is->sub_texture);
+                            }
+                            image = image->next;
+                        }
+                    }
                     sp->uploaded = 1;
                 }
             } else
                 sp = NULL;
         }
     }
-
-    calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
 
     if (!vp->uploaded) {
         if (upload_texture(&is->vid_texture, vp->frame, &is->img_convert_ctx) < 0)
@@ -1234,6 +1358,12 @@ static void stream_component_close(VideoState *is, int stream_index)
     case AVMEDIA_TYPE_SUBTITLE:
         decoder_abort(&is->subdec, &is->subpq);
         decoder_destroy(&is->subdec);
+#if TEXT_SUBTITLES_RENDERING
+        if (is->ass_track) {
+            ass_free_track(is->ass_track);
+            is->ass_track = NULL;
+        }
+#endif
         break;
     default:
         break;
@@ -1292,6 +1422,10 @@ static void stream_close(VideoState *is)
         SDL_DestroyTexture(is->vid_texture);
     if (is->sub_texture)
         SDL_DestroyTexture(is->sub_texture);
+#if TEXT_SUBTITLES_RENDERING
+    if (is->ass_renderer)
+        ass_renderer_done(is->ass_renderer);
+#endif
     av_free(is);
 }
 
@@ -1312,6 +1446,7 @@ static void do_exit(VideoState *is)
     if (show_status)
         printf("\n");
     SDL_Quit();
+    uninit_ass_library();
     av_log(NULL, AV_LOG_QUIET, "%s", "");
     exit(0);
 }
@@ -1657,16 +1792,28 @@ retry:
                         {
                             if (sp->uploaded) {
                                 int i;
+                                uint8_t *pixels;
+                                int pitch, j;
+                                if (sp->sub.format == 0) {
                                 for (i = 0; i < sp->sub.num_rects; i++) {
                                     AVSubtitleRect *sub_rect = sp->sub.rects[i];
-                                    uint8_t *pixels;
-                                    int pitch, j;
-
                                     if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels, &pitch)) {
                                         for (j = 0; j < sub_rect->h; j++, pixels += pitch)
                                             memset(pixels, 0, sub_rect->w << 2);
                                         SDL_UnlockTexture(is->sub_texture);
                                     }
+                                }
+                                } else {
+                                    ASS_Image *image = is->ass_image;
+                                    while (image) {
+                                        if (!SDL_LockTexture(is->sub_texture, &(SDL_Rect){image->dst_x, image->dst_y, image->w, image->h}, (void **)&pixels, &pitch)) {
+                                            for (j = 0; j < image->h; j++, pixels += pitch)
+                                                memset(pixels, 0, image->w << 2);
+                                            SDL_UnlockTexture(is->sub_texture);
+                                        }
+                                        image = image->next;
+                                    }
+                                    is->ass_image = NULL;
                                 }
                             }
                             frame_queue_next(&is->subpq);
@@ -2240,7 +2387,7 @@ static int subtitle_thread(void *arg)
 
         pts = 0;
 
-        if (got_subtitle && sp->sub.format == 0) {
+        if (got_subtitle) {
             if (sp->sub.pts != AV_NOPTS_VALUE)
                 pts = sp->sub.pts / (double)AV_TIME_BASE;
             sp->pts = pts;
@@ -2618,6 +2765,8 @@ static int stream_component_open(VideoState *is, int stream_index)
         av_dict_set_int(&opts, "lowres", stream_lowres, 0);
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO || avctx->codec_type == AVMEDIA_TYPE_AUDIO)
         av_dict_set(&opts, "refcounted_frames", "1", 0);
+    if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        av_dict_set(&opts, "sub_text_format", "ass", AV_DICT_DONT_OVERWRITE);
     if ((ret = avcodec_open2(avctx, codec, &opts)) < 0) {
         goto fail;
     }
@@ -3090,6 +3239,11 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 
     if (!(is->continue_read_thread = SDL_CreateCond())) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        goto fail;
+    }
+
+    if (init_ass_rendering(is) < 0) {
+        av_log(NULL, AV_LOG_FATAL, "Ass render init failed\n");
         goto fail;
     }
 
@@ -3718,6 +3872,9 @@ int main(int argc, char **argv)
 
     SDL_EventState(SDL_SYSWMEVENT, SDL_IGNORE);
     SDL_EventState(SDL_USEREVENT, SDL_IGNORE);
+
+    if (init_ass_library() < 0)
+        do_exit(NULL);
 
     av_init_packet(&flush_pkt);
     flush_pkt.data = (uint8_t *)&flush_pkt;
