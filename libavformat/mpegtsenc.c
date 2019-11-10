@@ -112,6 +112,7 @@ typedef struct MpegTSWrite {
     int64_t sdt_period_us;
     int64_t last_pat_ts;
     int64_t last_sdt_ts;
+    int64_t nb_packets;
 
     int omit_video_pes_length;
 } MpegTSWrite;
@@ -799,7 +800,7 @@ invalid:
 
 static int64_t get_pcr(const MpegTSWrite *ts, AVIOContext *pb)
 {
-    return av_rescale(avio_tell(pb) + 11, 8 * PCR_TIME_BASE, ts->mux_rate) +
+    return av_rescale(ts->nb_packets * TS_PACKET_SIZE + 11, 8 * PCR_TIME_BASE, ts->mux_rate) +
            ts->first_pcr;
 }
 
@@ -814,6 +815,7 @@ static void write_packet(AVFormatContext *s, const uint8_t *packet)
                    sizeof(tp_extra_header));
     }
     avio_write(s->pb, packet, TS_PACKET_SIZE);
+    ts->nb_packets++;
 }
 
 static void section_write_packet(MpegTSSection *s, const uint8_t *packet)
