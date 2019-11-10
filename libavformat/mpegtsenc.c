@@ -35,6 +35,8 @@
 #include "mpegts.h"
 
 #define PCR_TIME_BASE 27000000
+#define M2TS_DEFAULT_MUXRATE 54000000
+#define M2TS_DEFAULT_UHD_MUXRATE 128000000
 
 /* write DVB SI sections */
 
@@ -955,6 +957,15 @@ static int mpegts_init(AVFormatContext *s)
             av_log(s, AV_LOG_ERROR, "Only one program is allowed in m2ts mode!\n");
             return AVERROR(EINVAL);
         }
+        if (ts->mux_rate <= 1) {
+            ts->mux_rate = M2TS_DEFAULT_MUXRATE;
+            for (i = 0; i < s->nb_streams; i++) {
+                AVCodecParameters *codecpar = s->streams[i]->codecpar;
+                if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && codecpar->height > 1080)
+                    ts->mux_rate = M2TS_DEFAULT_UHD_MUXRATE;
+            }
+            av_log(s, AV_LOG_INFO, "Muxrate is not set for m2ts mode, using %d bps\n", ts->mux_rate);
+        }
     }
 
     if (s->max_delay < 0) /* Not set by the caller */
@@ -1186,10 +1197,16 @@ static int write_pcr_bits(uint8_t *buf, int64_t pcr)
 }
 
 /* Write a single null transport stream packet */
-static void mpegts_insert_null_packet(AVFormatContext *s)
+static void mpegts_insert_null_packet(AVFormatContext *s, int force)
 {
+    MpegTSWrite *ts = s->priv_data;
     uint8_t *q;
     uint8_t buf[TS_PACKET_SIZE];
+
+    if (ts->m2ts_mode && !force) {
+        ts->nb_packets++;
+        return;
+    }
 
     q    = buf;
     *q++ = 0x47;
@@ -1349,7 +1366,7 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                 if (write_pcr)
                     mpegts_insert_pcr_only(s, st);
                 else
-                    mpegts_insert_null_packet(s);
+                    mpegts_insert_null_packet(s, 0);
                 /* recalculate write_pcr and possibly retransmit si_info */
                 continue;
             }
@@ -1922,7 +1939,7 @@ static void mpegts_write_flush(AVFormatContext *s)
     if (ts->m2ts_mode) {
         int packets = (avio_tell(s->pb) / (TS_PACKET_SIZE + 4)) % 32;
         while (packets++ < 32)
-            mpegts_insert_null_packet(s);
+            mpegts_insert_null_packet(s, 1);
     }
 }
 
