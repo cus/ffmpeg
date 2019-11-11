@@ -1412,25 +1412,25 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                     ts->m2ts_last_pcr = FFMAX(pcr - ts->m2ts_pcr_period, ts->m2ts_last_pcr + ts->m2ts_pcr_period);
                     next_pcr = FFMIN(next_pcr, ts->m2ts_last_pcr + ts->m2ts_pcr_period);
                 } else {
-                for (int i = 0; i < s->nb_streams; i++) {
-                    /* Make the current stream the last, because for that we
-                     * can insert the pcr into the payload later */
-                    int st2_index = i < st->index ? i : (i + 1 == s->nb_streams ? st->index : i + 1);
-                    AVStream *st2 = s->streams[st2_index];
-                    MpegTSWriteStream *ts_st2 = st2->priv_data;
-                    if (ts_st2->pcr_period) {
-                        if (pcr - ts_st2->last_pcr >= ts_st2->pcr_period) {
-                            ts_st2->last_pcr = FFMAX(pcr - ts_st2->pcr_period, ts_st2->last_pcr + ts_st2->pcr_period);
-                            if (st2 != st) {
-                                mpegts_insert_pcr_only_for_stream(s, st2);
-                                pcr = get_pcr(ts, s->pb);
-                            } else {
-                                write_pcr = 1;
+                    for (int i = 0; i < s->nb_streams; i++) {
+                        /* Make the current stream the last, because for that we
+                         * can insert the pcr into the payload later */
+                        int st2_index = i < st->index ? i : (i + 1 == s->nb_streams ? st->index : i + 1);
+                        AVStream *st2 = s->streams[st2_index];
+                        MpegTSWriteStream *ts_st2 = st2->priv_data;
+                        if (ts_st2->pcr_period) {
+                            if (pcr - ts_st2->last_pcr >= ts_st2->pcr_period) {
+                                ts_st2->last_pcr = FFMAX(pcr - ts_st2->pcr_period, ts_st2->last_pcr + ts_st2->pcr_period);
+                                if (st2 != st) {
+                                    mpegts_insert_pcr_only_for_stream(s, st2);
+                                    pcr = get_pcr(ts, s->pb);
+                                } else {
+                                    write_pcr = 1;
+                                }
                             }
+                            next_pcr = FFMIN(next_pcr, ts_st2->last_pcr + ts_st2->pcr_period);
                         }
-                        next_pcr = FFMIN(next_pcr, ts_st2->last_pcr + ts_st2->pcr_period);
                     }
-                }
                 }
                 ts->next_pcr = next_pcr;
             }
