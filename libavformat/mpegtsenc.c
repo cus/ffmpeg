@@ -28,6 +28,7 @@
 #include "libavutil/opt.h"
 
 #include "libavcodec/internal.h"
+#include "libavcodec/put_bits.h"
 
 #include "avformat.h"
 #include "avio_internal.h"
@@ -77,6 +78,7 @@ typedef struct MpegTSWrite {
     const AVClass *av_class;
     MpegTSSection pat; /* MPEG-2 PAT table */
     MpegTSSection sdt; /* MPEG-2 SDT table context */
+    MpegTSSection sit; /* MPEG-2 SIT table context */
     MpegTSService **services;
     int64_t sdt_period; /* SDT period in PCR time base */
     int64_t pat_period; /* PAT/PMT period in PCR time base */
@@ -197,8 +199,8 @@ static int mpegts_write_section1(MpegTSSection *s, int tid, int id,
 {
     uint8_t section[1024], *q;
     unsigned int tot_len;
-    /* reserved_future_use field must be set to 1 for SDT */
-    unsigned int flags = tid == SDT_TID ? 0xf000 : 0xb000;
+    /* reserved_future_use field must be set to 1 for SDT or SIT */
+    unsigned int flags = (tid == SDT_TID || tid == SIT_TID) ? 0xf000 : 0xb000;
 
     tot_len = 3 + 5 + len + 4;
     /* check if not too big */
@@ -226,6 +228,7 @@ static int mpegts_write_section1(MpegTSSection *s, int tid, int id,
 
 /* we retransmit the SI info at this rate */
 #define SDT_RETRANS_TIME 500
+#define SIT_RETRANS_TIME 500
 #define PAT_RETRANS_TIME 100
 #define PCR_RETRANS_TIME 20
 
@@ -259,6 +262,10 @@ static void mpegts_write_pat(AVFormatContext *s)
     int i;
 
     q = data;
+    if (ts->m2ts_mode) {
+        put16(&q, 0);
+        put16(&q, 0xe000 | SIT_PID);
+    }
     for (i = 0; i < ts->nb_services; i++) {
         service = ts->services[i];
         put16(&q, service->sid);
@@ -726,6 +733,43 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
     return 0;
 }
 
+static void mpegts_write_sit(AVFormatContext *s)
+{
+    MpegTSWrite *ts = s->priv_data;
+    uint8_t data[SECTION_LENGTH];
+    PutBitContext bs;
+
+    init_put_bits(&bs, data, sizeof(data));
+
+    put_bits(&bs,  4, 0x0f);    // DVB_reserved_for_future_use
+
+    if (ts->m2ts_mode) {
+        put_bits(&bs, 12, 0x0a);      // transmission_info_loop_length
+        put_bits(&bs,  8, 0x63);      // descriptor_tag - partial_transport_stream_descriptor
+        put_bits(&bs,  8, 0x08);      // descriptor_length
+        put_bits(&bs,  2, 0x03);      // DVB_reserved_future_use
+        put_bits(&bs, 22, ts->mux_rate / 400); // peak_rate
+        put_bits(&bs,  2, 0x03);      // DVB_reserved_future_use
+        put_bits(&bs, 22, 0x3fffff);  // minimum_overall_smoothing_rate
+        put_bits(&bs,  2, 0x03);      // DVB_reserved_future_use
+        put_bits(&bs, 14, 0x3fff);    // maximum_overall_smoothing_buffer
+    } else {
+        put_bits(&bs, 12, 0);         // transmission_info_loop_length
+    }
+
+    for (int i = 0; i < ts->nb_services; i++) {
+        put_bits(&bs, 16, ts->services[i]->sid & 0xffff); // service_id (equivalent to program_number)
+        put_bits(&bs,  1, 1);          // DVB_reserved_future_use
+        put_bits(&bs,  3, 0);          // running_status
+        put_bits(&bs, 12, 0);          // service_loop_length
+    }
+
+    flush_put_bits(&bs);
+
+    mpegts_write_section1(&ts->sit, SIT_TID, 0xffff, ts->tables_version, 0, 0,
+                          data, put_bits_count(&bs) >> 3);
+}
+
 static void mpegts_write_sdt(AVFormatContext *s)
 {
     MpegTSWrite *ts = s->priv_data;
@@ -966,6 +1010,8 @@ static int mpegts_init(AVFormatContext *s)
             }
             av_log(s, AV_LOG_INFO, "Muxrate is not set for m2ts mode, using %d bps\n", ts->mux_rate);
         }
+        // this is used for sit period in m2ts mode
+        ts->sdt_period_us = SIT_RETRANS_TIME * 1000LL;
     }
 
     if (s->max_delay < 0) /* Not set by the caller */
@@ -1001,6 +1047,12 @@ static int mpegts_init(AVFormatContext *s)
     ts->sdt.discontinuity= ts->flags & MPEGTS_FLAG_DISCONT;
     ts->sdt.write_packet = section_write_packet;
     ts->sdt.opaque       = s;
+
+    ts->sit.pid          = SIT_PID;
+    ts->sit.cc           = 15;
+    ts->sit.discontinuity= ts->flags & MPEGTS_FLAG_DISCONT;
+    ts->sit.write_packet = section_write_packet;
+    ts->sit.opaque       = s;
 
     pids = av_malloc_array(s->nb_streams, sizeof(*pids));
     if (!pids) {
@@ -1169,7 +1221,10 @@ static void retransmit_si_info(AVFormatContext *s, int force_pat, int force_sdt,
     ) {
         if (pcr != AV_NOPTS_VALUE)
             ts->last_sdt_ts = FFMAX(pcr, ts->last_sdt_ts);
-        mpegts_write_sdt(s);
+        if (!ts->m2ts_mode)
+            mpegts_write_sdt(s);
+        else
+            mpegts_write_sit(s);
     }
     if ((pcr != AV_NOPTS_VALUE && ts->last_pat_ts == AV_NOPTS_VALUE) ||
         (pcr != AV_NOPTS_VALUE && pcr - ts->last_pat_ts >= ts->pat_period) ||
@@ -2081,7 +2136,7 @@ static const AVOption options[] = {
     { "mpegts_copyts", "don't offset dts/pts",
       offsetof(MpegTSWrite, copyts), AV_OPT_TYPE_BOOL,
       { .i64 = -1 }, -1, 1, AV_OPT_FLAG_ENCODING_PARAM },
-    { "tables_version", "set PAT, PMT and SDT version",
+    { "tables_version", "set PAT, PMT and SDT or SIT version",
       offsetof(MpegTSWrite, tables_version), AV_OPT_TYPE_INT,
       { .i64 = 0 }, 0, 31, AV_OPT_FLAG_ENCODING_PARAM },
     { "omit_video_pes_length", "Omit the PES packet length for video packets",
