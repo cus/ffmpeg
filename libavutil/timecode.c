@@ -196,8 +196,8 @@ static int check_timecode(void *log_ctx, AVTimecode *tc)
         av_log(log_ctx, AV_LOG_ERROR, "Valid timecode frame rate must be specified. Minimum value is 1\n");
         return AVERROR(EINVAL);
     }
-    if ((tc->flags & AV_TIMECODE_FLAG_DROPFRAME) && tc->fps != 30 && tc->fps != 60) {
-        av_log(log_ctx, AV_LOG_ERROR, "Drop frame is only allowed with 30000/1001 or 60000/1001 FPS\n");
+    if ((tc->flags & AV_TIMECODE_FLAG_DROPFRAME) && tc->fps % 30 != 0) {
+        av_log(log_ctx, AV_LOG_ERROR, "Drop frame is only allowed with multiples of 30000/1001 FPS\n");
         return AVERROR(EINVAL);
     }
     if (check_fps(tc->fps) < 0) {
@@ -252,7 +252,7 @@ int av_timecode_init_from_string(AVTimecode *tc, AVRational rate, const char *st
     tc->start = (hh*3600 + mm*60 + ss) * tc->fps + ff;
     if (tc->flags & AV_TIMECODE_FLAG_DROPFRAME) { /* adjust frame number */
         int tmins = 60*hh + mm;
-        tc->start -= (tc->fps == 30 ? 2 : 4) * (tmins - tmins/10);
+        tc->start -= (tc->fps / 30 * 2) * (tmins - tmins/10);
     }
     return 0;
 }
