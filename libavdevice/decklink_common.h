@@ -155,13 +155,6 @@ struct decklink_ctx {
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;
 
-#ifdef _WIN32
-typedef unsigned int buffercount_type;
-IDeckLinkIterator *CreateDeckLinkIteratorInstance(void);
-#else
-typedef uint32_t buffercount_type;
-#endif
-
 static const BMDAudioConnection decklink_audio_connection_map[] = {
     (BMDAudioConnection)0,
     bmdAudioConnectionEmbedded,
