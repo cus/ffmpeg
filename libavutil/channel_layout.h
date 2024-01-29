@@ -618,6 +618,19 @@ void av_channel_description_bprint(struct AVBPrint *bp, enum AVChannel channel_i
 enum AVChannel av_channel_from_string(const char *name);
 
 /**
+ * Initialize a custom channel layout with the specified number of channels.
+ * The designation of all channels will be unknown.
+ *
+ * @param channel_layout the layout structure to be initialized
+ * @param nb_channels the number of channels
+ *
+ * @return 0 on success
+ *         AVERROR(EINVAL) if the number of channels <= 0
+ *         AVERROR(ENOMEM) if the channel map could not be allocated
+ */
+int av_channel_layout_from_custom(AVChannelLayout *channel_layout, int nb_channels);
+
+/**
  * Initialize a native channel layout from a bitmask indicating which channels
  * are present.
  *
