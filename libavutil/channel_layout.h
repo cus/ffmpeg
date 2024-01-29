@@ -818,6 +818,17 @@ int av_channel_layout_check(const AVChannelLayout *channel_layout);
 int av_channel_layout_compare(const AVChannelLayout *chl, const AVChannelLayout *chl1);
 
 /**
+ * Try changing the AVChannelOrder of a channel layout.
+ *
+ * @param channel_layout channel layout which will be changed
+ * @param order the desired channel layout order
+ * @return 0 on success or if the channel layout is already in the desired order
+ *         1 if using the desired order is not possible for the specified layout
+ *         AVERROR code on error
+ */
+int av_channel_layout_retype(AVChannelLayout *channel_layout, enum AVChannelOrder order);
+
+/**
  * @}
  */
 

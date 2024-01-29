@@ -1036,3 +1036,77 @@ uint64_t av_channel_layout_subset(const AVChannelLayout *channel_layout,
 
     return ret;
 }
+
+static int64_t masked_description(AVChannelLayout *channel_layout, int start_channel)
+{
+    uint64_t mask = 0;
+    for (int i = start_channel; i < channel_layout->nb_channels; i++) {
+        enum AVChannel ch = channel_layout->u.map[i].id;
+        if (ch >= 0 && ch < 63 && mask < (1ULL << ch))
+            mask |= (1ULL << ch);
+        else
+            return AVERROR(EINVAL);
+    }
+    return mask;
+}
+
+int av_channel_layout_retype(AVChannelLayout *channel_layout, enum AVChannelOrder order)
+{
+    if (!av_channel_layout_check(channel_layout))
+        return AVERROR(EINVAL);
+
+    if (channel_layout->order == order)
+        return 0;
+
+    switch (order) {
+    case AV_CHANNEL_ORDER_UNSPEC: {
+        int nb_channels = channel_layout->nb_channels;
+        av_channel_layout_uninit(channel_layout);
+        channel_layout->order       = AV_CHANNEL_ORDER_UNSPEC;
+        channel_layout->nb_channels = nb_channels;
+        return 0;
+        }
+    case AV_CHANNEL_ORDER_CUSTOM: {
+        AVChannelLayout custom = { 0 };
+        int ret = av_channel_layout_from_custom(&custom, channel_layout->nb_channels);
+        if (ret < 0)
+            return ret;
+        if (channel_layout->order != AV_CHANNEL_ORDER_UNSPEC)
+            for (int i = 0; i < channel_layout->nb_channels; i++)
+                custom.u.map[i].id = av_channel_layout_channel_from_index(channel_layout, i);
+        av_channel_layout_uninit(channel_layout);
+        *channel_layout = custom;
+        return 0;
+        }
+    case AV_CHANNEL_ORDER_NATIVE:
+        if (channel_layout->order == AV_CHANNEL_ORDER_CUSTOM) {
+            int64_t mask = masked_description(channel_layout, 0);
+            if (mask < 0)
+                return 1;
+            av_channel_layout_uninit(channel_layout);
+            return av_channel_layout_from_mask(channel_layout, mask);
+        } else {
+            return 1;
+        }
+    case AV_CHANNEL_ORDER_AMBISONIC:
+        if (channel_layout->order == AV_CHANNEL_ORDER_CUSTOM) {
+            int64_t mask;
+            int nb_channels = channel_layout->nb_channels;
+            int order = ambisonic_order(channel_layout);
+            if (order < 0)
+                return 1;
+            mask = masked_description(channel_layout, (order + 1) * (order + 1));
+            if (mask < 0)
+                return 1;
+            av_channel_layout_uninit(channel_layout);
+            channel_layout->order       = AV_CHANNEL_ORDER_AMBISONIC;
+            channel_layout->nb_channels = nb_channels;
+            channel_layout->u.mask      = mask;
+            return 0;
+        } else {
+            return 1;
+        }
+    default:
+        return 1;
+    }
+}
